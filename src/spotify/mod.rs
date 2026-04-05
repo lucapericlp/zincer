@@ -25,7 +25,7 @@ use crate::music_api::{
     Song, Songs,
 };
 use crate::spotify::model::SpotifySearchResponse;
-use crate::utils::debug_response_json;
+use crate::utils::{debug_response_bytes, http_error_with_body, parse_response_json};
 
 pub struct SpotifyApi {
     client: reqwest::Client,
@@ -70,7 +70,13 @@ impl SpotifyApi {
             Self::request_token(&config, client_id, client_secret, redirect_uri).await?
         } else {
             info!("refreshing token");
-            Self::refresh_token(&config, client_id, client_secret, &oauth_token_path).await?
+            match Self::refresh_token(&config, client_id, client_secret, &oauth_token_path).await {
+                Ok(token) => token,
+                Err(err) => {
+                    warn!("failed to refresh Spotify token, requesting a new one: {err}");
+                    Self::request_token(&config, client_id, client_secret, redirect_uri).await?
+                }
+            }
         };
         // Write new token
         let mut file = std::fs::File::create(&oauth_token_path)?;
@@ -139,10 +145,12 @@ impl SpotifyApi {
             .send()
             .await?;
         let status = res.status();
-        let token = debug_response_json(config, res, Self::RES_DEBUG_FILENAME).await?;
         if !status.is_success() {
-            return Err(eyre!("Failed to get spotify token: status {}", status,));
+            let body = debug_response_bytes(config, res, Self::RES_DEBUG_FILENAME).await?;
+            return Err(http_error_with_body(status, &body));
         }
+        let body = debug_response_bytes(config, res, Self::RES_DEBUG_FILENAME).await?;
+        let token = parse_response_json(&body, Self::RES_DEBUG_FILENAME)?;
         Ok(token)
     }
 
@@ -165,11 +173,12 @@ impl SpotifyApi {
 
         let res = client.post(Self::TOKEN_URL).form(&params).send().await?;
         let status = res.status();
-        let refresh_token: OAuthRefreshToken =
-            debug_response_json(config, res, Self::RES_DEBUG_FILENAME).await?;
         if !status.is_success() {
-            return Err(eyre!("Failed to refresh spotify token: status {}", status));
+            let body = debug_response_bytes(config, res, Self::RES_DEBUG_FILENAME).await?;
+            return Err(http_error_with_body(status, &body));
         }
+        let body = debug_response_bytes(config, res, Self::RES_DEBUG_FILENAME).await?;
+        let refresh_token: OAuthRefreshToken = parse_response_json(&body, Self::RES_DEBUG_FILENAME)?;
 
         oauth_token.access_token = refresh_token.access_token;
         oauth_token.expires_in = refresh_token.expires_in;
@@ -287,10 +296,12 @@ impl SpotifyApi {
             // Retry request
             return self.make_request_json(path, method, limit, offset).await;
         }
-        let obj = debug_response_json(&self.config, res, Self::RES_DEBUG_FILENAME).await?;
         if status != StatusCode::OK && status != StatusCode::CREATED {
-            return Err(eyre!("Invalid HTTP status: {}", status));
+            let body = debug_response_bytes(&self.config, res, Self::RES_DEBUG_FILENAME).await?;
+            return Err(http_error_with_body(status, &body));
         }
+        let body = debug_response_bytes(&self.config, res, Self::RES_DEBUG_FILENAME).await?;
+        let obj = parse_response_json(&body, Self::RES_DEBUG_FILENAME)?;
         Ok(obj)
     }
 }

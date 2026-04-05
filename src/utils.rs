@@ -1,5 +1,7 @@
 use color_eyre::Result;
+use color_eyre::eyre::eyre;
 use regex::Regex;
+use reqwest::StatusCode;
 use serde::de::DeserializeOwned;
 use tracing::error;
 
@@ -94,30 +96,49 @@ pub async fn debug_response_json<T>(
 where
     T: DeserializeOwned,
 {
+    let full = debug_response_bytes(config, res, platform).await?;
+    parse_response_json(&full, platform)
+}
+
+pub async fn debug_response_bytes(
+    config: &ConfigArgs,
+    res: reqwest::Response,
+    platform: &str,
+) -> Result<Vec<u8>> {
     const DEBUG_FOLDER: &str = "debug";
 
-    let res = if config.debug {
-        let full = res.bytes().await?;
+    let full = res.bytes().await?.to_vec();
+    if config.debug {
         std::fs::write(
             format!("{}/{}_last_res.json", DEBUG_FOLDER, platform),
             &full,
         )?;
-        if full.is_empty() {
-            serde_json::from_str("null")?
-        } else {
-            serde_json::from_slice(&full).inspect_err(|_| {
-                let _ = std::fs::write(format!("debug/{}_last_error.json", platform), &full);
-            })?
-        }
+    }
+    Ok(full)
+}
+
+pub fn parse_response_json<T>(full: &[u8], platform: &str) -> Result<T>
+where
+    T: DeserializeOwned,
+{
+    if full.is_empty() {
+        return Ok(serde_json::from_str("null")?);
+    }
+
+    let res: serde_json::Result<T> = serde_json::from_slice(full);
+    Ok(res.inspect_err(|_| {
+        let _ = std::fs::write(format!("debug/{}_last_error.json", platform), full);
+    })?)
+}
+
+pub fn http_error_with_body(status: StatusCode, body: &[u8]) -> color_eyre::Report {
+    let body = String::from_utf8_lossy(body);
+    let body = body.trim();
+    if body.is_empty() {
+        eyre!("Invalid HTTP status: {}", status)
     } else {
-        let full = res.bytes().await?;
-        if full.is_empty() {
-            serde_json::from_str("null")?
-        } else {
-            serde_json::from_slice(&full)?
-        }
-    };
-    Ok(res)
+        eyre!("Invalid HTTP status: {}. Response body: {}", status, body)
+    }
 }
 
 #[cfg(test)]

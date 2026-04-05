@@ -1,7 +1,6 @@
 mod model;
 mod response;
 
-use std::io::Read;
 use std::path::PathBuf;
 
 use async_trait::async_trait;
@@ -9,9 +8,10 @@ use color_eyre::Result;
 use color_eyre::eyre::eyre;
 use model::{TidalMediaResponse, TidalMediaResponseSingle, TidalOAuthDeviceRes};
 use reqwest::header::HeaderMap;
+use serde::Deserialize;
 use serde::de::{DeserializeOwned, IgnoredAny};
 use serde_json::json;
-use tracing::info;
+use tracing::{info, warn};
 
 use self::model::{TidalPageResponse, TidalPlaylistResponse, TidalSongItemResponse};
 use crate::ConfigArgs;
@@ -20,7 +20,9 @@ use crate::music_api::{
     Playlists, Song, Songs,
 };
 use crate::tidal::model::{TidalPlaylistCreateResponse, TidalSearchResponse};
-use crate::utils::debug_response_json;
+use crate::utils::{
+    debug_response_bytes, http_error_with_body, parse_response_json,
+};
 
 pub struct TidalApi {
     client: reqwest::Client,
@@ -44,6 +46,8 @@ impl TidalApi {
     const TOKEN_URL: &'static str = "https://auth.tidal.com/v1/oauth2/token";
     const SCOPE: &'static str = "r_usr w_usr w_sub";
     const RES_DEBUG_FILENAME: &'static str = MusicApiType::Tidal.short_name();
+    const MAX_RETRIES: u32 = 5;
+    const ADD_CHUNK_SIZE: usize = 100;
 
     pub async fn new(
         client_id: &str,
@@ -57,7 +61,13 @@ impl TidalApi {
             Self::request_token(client_id, client_secret, &config).await?
         } else {
             info!("refreshing token");
-            Self::refresh_token(client_id, client_secret, &oauth_token_path, &config).await?
+            match Self::refresh_token(client_id, client_secret, &oauth_token_path, &config).await {
+                Ok(token) => token,
+                Err(err) => {
+                    warn!("failed to refresh TIDAL token, requesting a new one: {err}");
+                    Self::request_token(client_id, client_secret, &config).await?
+                }
+            }
         };
         // Write new token
         let mut file = std::fs::File::create(&oauth_token_path)?;
@@ -83,11 +93,12 @@ impl TidalApi {
         let url = format!("{}/users/me", Self::API_V2_URL);
         let res = client.get(&url).send().await?;
         let status = res.status();
-        let me_res: TidalMediaResponseSingle =
-            debug_response_json(&config, res, Self::RES_DEBUG_FILENAME).await?;
         if !status.is_success() {
-            return Err(eyre!("Invalid HTTP status: {}", status));
+            let body = debug_response_bytes(&config, res, Self::RES_DEBUG_FILENAME).await?;
+            return Err(http_error_with_body(status, &body));
         }
+        let body = debug_response_bytes(&config, res, Self::RES_DEBUG_FILENAME).await?;
+        let me_res: TidalMediaResponseSingle = parse_response_json(&body, Self::RES_DEBUG_FILENAME)?;
         let country_code = me_res.data.attributes.country.unwrap_or("US".into());
 
         Ok(Self {
@@ -110,17 +121,23 @@ impl TidalApi {
         });
         let res = client.post(Self::AUTH_URL).form(&params).send().await?;
         let status = res.status();
-        let device_res: TidalOAuthDeviceRes =
-            debug_response_json(config, res, Self::RES_DEBUG_FILENAME).await?;
         if !status.is_success() {
-            return Err(eyre!("Invalid HTTP status: {}", status));
+            let body = debug_response_bytes(config, res, Self::RES_DEBUG_FILENAME).await?;
+            return Err(http_error_with_body(status, &body));
         }
+        let body = debug_response_bytes(config, res, Self::RES_DEBUG_FILENAME).await?;
+        let device_res: TidalOAuthDeviceRes = parse_response_json(&body, Self::RES_DEBUG_FILENAME)?;
 
-        let url = format!("https://{}", device_res.verification_uri_complete);
+        let url = if device_res.verification_uri_complete.starts_with("http://")
+            || device_res.verification_uri_complete.starts_with("https://")
+        {
+            device_res.verification_uri_complete.clone()
+        } else {
+            format!("https://{}", device_res.verification_uri_complete)
+        };
 
         webbrowser::open(&url)?;
-        info!("please authorize the app in your browser and press enter in the CLI");
-        std::io::stdin().read_exact(&mut [0])?;
+        info!("please authorize the app in your browser: {}", url);
 
         let auth_token = OAuthReqToken {
             client_id: client_id.to_string(),
@@ -128,19 +145,50 @@ impl TidalApi {
             grant_type: "urn:ietf:params:oauth:grant-type:device_code".to_string(),
             scope: Self::SCOPE.to_string(),
         };
-        let res = client
-            .post(Self::TOKEN_URL)
-            .basic_auth(client_id, Some(client_secret))
-            .form(&auth_token)
-            .send()
-            .await?;
-        let status = res.status();
-        let token: OAuthToken = debug_response_json(config, res, Self::RES_DEBUG_FILENAME).await?;
-        if !status.is_success() {
-            return Err(eyre!("Invalid HTTP status: {}", status));
-        }
+        let poll_interval = device_res.interval.unwrap_or(2);
+        let expires_at = std::time::Instant::now()
+            + std::time::Duration::from_secs(device_res.expires_in as u64);
 
-        Ok(token)
+        loop {
+            let res = client
+                .post(Self::TOKEN_URL)
+                .basic_auth(client_id, Some(client_secret))
+                .form(&auth_token)
+                .send()
+                .await?;
+            let status = res.status();
+            let body = res.text().await?;
+
+            if status.is_success() {
+                return Ok(serde_json::from_str(&body)?);
+            }
+
+            let error = serde_json::from_str::<TidalOAuthPendingError>(&body).ok();
+            match error.as_ref().map(|err| err.error.as_str()) {
+                Some("authorization_pending") => {
+                    tokio::time::sleep(std::time::Duration::from_secs(poll_interval)).await;
+                }
+                Some("slow_down") => {
+                    tokio::time::sleep(std::time::Duration::from_secs(poll_interval + 1)).await;
+                }
+                Some("expired_token") => {
+                    return Err(eyre!(
+                        "TIDAL device authorization expired before completion"
+                    ));
+                }
+                _ => {
+                    return Err(eyre!(
+                        "Invalid HTTP status: {} while requesting TIDAL token: {}",
+                        status,
+                        body
+                    ));
+                }
+            }
+
+            if std::time::Instant::now() >= expires_at {
+                return Err(eyre!("TIDAL device authorization timed out"));
+            }
+        }
     }
 
     async fn refresh_token(
@@ -162,11 +210,12 @@ impl TidalApi {
 
         let res = client.post(Self::TOKEN_URL).form(&params).send().await?;
         let status = res.status();
-        let refresh_token: OAuthRefreshToken =
-            debug_response_json(config, res, Self::RES_DEBUG_FILENAME).await?;
         if !status.is_success() {
-            return Err(eyre!("Invalid HTTP status: {}", status));
+            let body = debug_response_bytes(config, res, Self::RES_DEBUG_FILENAME).await?;
+            return Err(http_error_with_body(status, &body));
         }
+        let body = debug_response_bytes(config, res, Self::RES_DEBUG_FILENAME).await?;
+        let refresh_token: OAuthRefreshToken = parse_response_json(&body, Self::RES_DEBUG_FILENAME)?;
 
         oauth_token.access_token = refresh_token.access_token;
         oauth_token.expires_in = refresh_token.expires_in;
@@ -213,23 +262,167 @@ impl TidalApi {
     where
         T: DeserializeOwned,
     {
-        let mut request = match method {
-            HttpMethod::Get(p) => self.client.get(url).query(p),
-            HttpMethod::Post(b) => self.client.post(url).form(b),
-            HttpMethod::Put(b) => self.client.put(url).form(b),
-        };
-        if let Some((limit, offset)) = lim_off {
-            request = request.query(&[("limit", limit), ("offset", offset)]);
+        for attempt in 0..=Self::MAX_RETRIES {
+            let mut request = match method {
+                HttpMethod::Get(p) => self.client.get(url).query(p),
+                HttpMethod::Post(b) => self.client.post(url).form(b),
+                HttpMethod::Put(b) => self.client.put(url).form(b),
+            };
+            if let Some((limit, offset)) = lim_off {
+                request = request.query(&[("limit", limit), ("offset", offset)]);
+            }
+
+            let res = request.send().await?;
+            let status = res.status();
+            if status.is_success() {
+                let body = debug_response_bytes(&self.config, res, Self::RES_DEBUG_FILENAME).await?;
+                let obj = parse_response_json(&body, Self::RES_DEBUG_FILENAME)?;
+                return Ok(obj);
+            }
+
+            if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                Self::wait_before_retry(&res, attempt, "TIDAL rate limit").await?;
+                continue;
+            }
+
+            let body = debug_response_bytes(&self.config, res, Self::RES_DEBUG_FILENAME).await?;
+            if status.is_server_error() && attempt < Self::MAX_RETRIES {
+                warn!(
+                    "transient TIDAL API error on {} (attempt {}/{}): {}",
+                    url,
+                    attempt + 1,
+                    Self::MAX_RETRIES + 1,
+                    String::from_utf8_lossy(&body)
+                );
+                Self::sleep_before_retry(attempt).await;
+                continue;
+            }
+            return Err(http_error_with_body(status, &body));
         }
 
-        let res = request.send().await?;
-        let status = res.status();
-        let obj = debug_response_json(&self.config, res, Self::RES_DEBUG_FILENAME).await?;
-        if !status.is_success() {
-            return Err(eyre!("Invalid HTTP status: {}", status));
-        }
-        Ok(obj)
+        unreachable!("TIDAL request retry loop exhausted unexpectedly")
     }
+
+    async fn wait_before_retry(res: &reqwest::Response, attempt: u32, context: &str) -> Result<()> {
+        let delay = res
+            .headers()
+            .get("Retry-After")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or_else(|| 1 + u64::from(attempt));
+        warn!("{context}, retrying in {delay}s");
+        tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+        Ok(())
+    }
+
+    async fn sleep_before_retry(attempt: u32) {
+        let delay = 1_u64 << attempt.min(4);
+        tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+    }
+
+    async fn fetch_playlist_etag(&self, playlist_id: &str) -> Result<reqwest::header::HeaderValue> {
+        let url = format!("{}/v1/playlists/{}", Self::API_URL, playlist_id);
+        let params = json!({
+            "countryCode": self.country_code,
+        });
+
+        for attempt in 0..=Self::MAX_RETRIES {
+            let res = self.client.get(&url).query(&params).send().await?;
+            let status = res.status();
+            let etag = res.headers().get("ETag").cloned();
+
+            if status.is_success() {
+                let body = debug_response_bytes(&self.config, res, Self::RES_DEBUG_FILENAME).await?;
+                let _: IgnoredAny = parse_response_json(&body, Self::RES_DEBUG_FILENAME)?;
+                return etag.ok_or(eyre!("No ETag in Tidal Response"));
+            }
+
+            if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                Self::wait_before_retry(&res, attempt, "TIDAL rate limit").await?;
+                continue;
+            }
+
+            let body = debug_response_bytes(&self.config, res, Self::RES_DEBUG_FILENAME).await?;
+            if status.is_server_error() && attempt < Self::MAX_RETRIES {
+                warn!(
+                    "transient TIDAL playlist ETag error (attempt {}/{}): {}",
+                    attempt + 1,
+                    Self::MAX_RETRIES + 1,
+                    String::from_utf8_lossy(&body)
+                );
+                Self::sleep_before_retry(attempt).await;
+                continue;
+            }
+            return Err(http_error_with_body(status, &body));
+        }
+
+        unreachable!("TIDAL ETag retry loop exhausted unexpectedly")
+    }
+
+    async fn add_song_chunk_to_playlist(
+        &self,
+        playlist_id: &str,
+        etag: reqwest::header::HeaderValue,
+        songs: &[Song],
+    ) -> Result<()> {
+        let url = format!("{}/v1/playlists/{}/items", Self::API_URL, playlist_id);
+        let params = json!({
+            "trackIds": songs.iter().map(|s| s.id.as_str()).collect::<Vec<_>>().join(","),
+            "onDuplicate": "FAIL",
+            "onArtifactNotFound": "FAIL",
+        });
+        let mut etag = etag;
+
+        for attempt in 0..=Self::MAX_RETRIES {
+            let res = self
+                .client
+                .post(&url)
+                .header("If-None-Match", etag.clone())
+                .form(&params)
+                .send()
+                .await?;
+            let status = res.status();
+
+            if status.is_success() {
+                let body = debug_response_bytes(&self.config, res, Self::RES_DEBUG_FILENAME).await?;
+                let () = parse_response_json(&body, Self::RES_DEBUG_FILENAME)?;
+                return Ok(());
+            }
+
+            if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                Self::wait_before_retry(&res, attempt, "TIDAL rate limit").await?;
+                continue;
+            }
+
+            let body = debug_response_bytes(&self.config, res, Self::RES_DEBUG_FILENAME).await?;
+            if status == reqwest::StatusCode::PRECONDITION_FAILED && attempt < Self::MAX_RETRIES {
+                warn!(
+                    "stale TIDAL playlist ETag while adding songs to {}, refreshing and retrying",
+                    playlist_id
+                );
+                etag = self.fetch_playlist_etag(playlist_id).await?;
+                continue;
+            }
+            if status.is_server_error() && attempt < Self::MAX_RETRIES {
+                warn!(
+                    "transient TIDAL playlist add error (attempt {}/{}): {}",
+                    attempt + 1,
+                    Self::MAX_RETRIES + 1,
+                    String::from_utf8_lossy(&body)
+                );
+                Self::sleep_before_retry(attempt).await;
+                continue;
+            }
+            return Err(http_error_with_body(status, &body));
+        }
+
+        unreachable!("TIDAL add chunk retry loop exhausted unexpectedly")
+    }
+}
+
+#[derive(Deserialize, Debug)]
+struct TidalOAuthPendingError {
+    error: String,
 }
 
 #[async_trait]
@@ -294,39 +487,10 @@ impl MusicApi for TidalApi {
             return Ok(());
         }
 
-        // 1. query playlist ETag
-        let url = format!("{}/v1/playlists/{}", Self::API_URL, playlist.id);
-        let params = json!({
-            "countryCode": self.country_code,
-        });
-        let res = self.client.get(&url).query(&params).send().await?;
-        let status = res.status();
-        let etag = res.headers().get("ETag").cloned();
-        let _: IgnoredAny =
-            debug_response_json(&self.config, res, Self::RES_DEBUG_FILENAME).await?;
-        let etag = etag.ok_or(eyre!("No ETag in Tidal Response"))?;
-        if !status.is_success() {
-            return Err(eyre!("Invalid HTTP status: {}", status));
-        }
-
-        // 2. add songs to playlist
-        let url = format!("{}/v1/playlists/{}/items", Self::API_URL, playlist.id);
-        let params = json!({
-            "trackIds": songs.iter().map(|s| s.id.as_str()).collect::<Vec<_>>().join(","),
-            "onDuplicate": "FAIL",
-            "onArtifactNotFound": "FAIL",
-        });
-        let res = self
-            .client
-            .post(url)
-            .header("If-None-Match", etag)
-            .form(&params)
-            .send()
-            .await?;
-        let status = res.status();
-        let () = debug_response_json(&self.config, res, Self::RES_DEBUG_FILENAME).await?;
-        if !status.is_success() {
-            return Err(eyre!("Invalid HTTP status: {}", status));
+        for songs_chunk in songs.chunks(Self::ADD_CHUNK_SIZE) {
+            let etag = self.fetch_playlist_etag(&playlist.id).await?;
+            self.add_song_chunk_to_playlist(&playlist.id, etag, songs_chunk)
+                .await?;
         }
 
         Ok(())

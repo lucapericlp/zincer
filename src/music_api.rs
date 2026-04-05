@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use color_eyre::eyre::Result;
-use futures::future::try_join_all;
+use futures::stream::{self, StreamExt, TryStreamExt};
 use serde::{Deserialize, Serialize};
 use strsim::normalized_levenshtein;
 use tracing::debug;
@@ -13,6 +13,10 @@ pub type DynMusicApi = Box<dyn MusicApi + Sync>;
 
 #[async_trait]
 pub trait MusicApi {
+    fn request_concurrency(&self) -> usize {
+        4
+    }
+
     fn api_type(&self) -> MusicApiType;
     fn country_code(&self) -> &str;
 
@@ -23,13 +27,23 @@ pub trait MusicApi {
     async fn get_playlists_full(&self) -> Result<Vec<Playlist>> {
         let mut playlists = self.get_playlists_info().await?;
 
-        let mut requests = vec![];
-        for playlist in &mut playlists {
-            requests.push(self.get_playlist_songs(&playlist.id));
-        }
-        let results = try_join_all(requests).await?;
-        for (i, songs) in results.into_iter().enumerate() {
-            playlists[i].songs = songs;
+        let playlist_ids = playlists
+            .iter()
+            .enumerate()
+            .map(|(index, playlist)| (index, playlist.id.clone()))
+            .collect::<Vec<_>>();
+        let requests = playlist_ids.into_iter().map(|(index, playlist_id)| async move {
+                let songs = self.get_playlist_songs(&playlist_id).await?;
+                Ok::<_, color_eyre::Report>((index, songs))
+            });
+        let results: Vec<(usize, Vec<Song>)> = stream::iter(requests)
+            .buffered(self.request_concurrency())
+            .try_collect()
+            .await?;
+        let mut results = results;
+        results.sort_by_key(|(index, _)| *index);
+        for (index, songs) in results {
+            playlists[index].songs = songs;
         }
 
         Ok(playlists)
@@ -46,12 +60,21 @@ pub trait MusicApi {
     async fn search_song(&self, song: &Song) -> Result<Option<Song>>;
 
     async fn search_songs(&self, songs: &[Song]) -> Result<Vec<Option<Song>>> {
-        let mut requests = vec![];
-        for song in songs {
-            requests.push(self.search_song(song));
-        }
-        let results = try_join_all(requests).await?;
-        Ok(results)
+        let owned_songs = songs
+            .iter()
+            .cloned()
+            .enumerate()
+            .collect::<Vec<_>>();
+        let requests = owned_songs.into_iter().map(|(index, song)| async move {
+            let result = self.search_song(&song).await?;
+            Ok::<_, color_eyre::Report>((index, result))
+        });
+        let mut results: Vec<(usize, Option<Song>)> = stream::iter(requests)
+            .buffered(self.request_concurrency())
+            .try_collect()
+            .await?;
+        results.sort_by_key(|(index, _)| *index);
+        Ok(results.into_iter().map(|(_, song)| song).collect())
     }
 
     async fn add_likes(&self, songs: &[Song]) -> Result<()>;

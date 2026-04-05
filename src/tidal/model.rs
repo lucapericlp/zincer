@@ -9,6 +9,7 @@ pub struct TidalOAuthDeviceRes {
     pub verification_uri: String,
     pub verification_uri_complete: String,
     pub expires_in: u32,
+    pub interval: Option<u64>,
 }
 
 ////////////

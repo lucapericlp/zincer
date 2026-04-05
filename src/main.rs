@@ -48,16 +48,18 @@ async fn main() -> Result<()> {
         }
     }
 
-    let src_api = args.src.parse(&args, &config_dir).await?;
     match args.src.get_dst() {
         MusicPlatformDst::Export { output, minify } => {
+            let src_api = args.src.parse(&args, &config_dir).await?;
             export(src_api, output, *minify).await?;
         }
         MusicPlatformDst::Import { input } => {
+            let src_api = args.src.parse(&args, &config_dir).await?;
             import(input, src_api, args.config).await?;
         }
         _ => {
             let dst_api = args.src.get_dst().parse(&args, &config_dir).await?;
+            let src_api = args.src.parse(&args, &config_dir).await?;
             synchronize(src_api, dst_api, args.config).await?;
         }
     }
