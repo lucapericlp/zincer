@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+tmp="$(mktemp "${TMPDIR:-/tmp}/syncdisboi-tidal-playlists.XXXXXX.json")"
+trap 'rm -f "$tmp"' EXIT
+
+cd "$repo_root"
+
+cargo run --quiet -- --logging warn tidal export -o "$tmp" --minify
+
+python3 - "$tmp" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as f:
+    playlists = json.load(f)
+
+if not playlists:
+    print("No Tidal playlists found.")
+    raise SystemExit(0)
+
+playlists = sorted(playlists, key=lambda p: p.get("name", "").lower())
+name_width = max(len(p.get("name", "")) for p in playlists)
+
+for playlist in playlists:
+    name = playlist.get("name") or "<unnamed>"
+    playlist_id = playlist.get("id")
+    if not playlist_id:
+        continue
+    print(f"{name:<{name_width}}  https://tidal.com/browse/playlist/{playlist_id}")
+PY
