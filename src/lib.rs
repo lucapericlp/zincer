@@ -7,6 +7,8 @@ pub mod tidal;
 pub mod utils;
 pub mod yt_music;
 
+use std::path::PathBuf;
+
 use clap::Parser;
 
 // TODO: I don't really like depending on clap for the library,
@@ -31,6 +33,10 @@ pub struct ConfigArgs {
     /// have different ISRC codes.
     #[arg(long, default_value = "false")]
     pub diff_country: bool,
+
+    /// Base path for the timestamped playlist synchronization report.
+    #[arg(long, value_name = "PATH", default_value = "sync_report.json")]
+    pub sync_report: PathBuf,
 
     /// Proxy to use for all requests in the format http://<ip>:<port>
     #[arg(long)]

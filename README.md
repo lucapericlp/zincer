@@ -150,6 +150,11 @@ Notes:
 
 ### Debug mode
 
+Playlist synchronization writes a timestamped JSON report by default, for example
+`sync_report_20260508T143012Z.json`. Use `--sync-report <PATH>` to choose a
+different base output path. The report includes per-source-playlist success
+counts and the source tracks that were not synced to the destination playlist.
+
 You can enable debug mode (`--debug`) to generate detailed statistics about the synchronization process.
 
 Files are saved in the `debug/` folder:

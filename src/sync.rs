@@ -1,5 +1,14 @@
+use std::{
+    ffi::OsString,
+    fs::OpenOptions,
+    io::{ErrorKind, Write},
+    path::{Path, PathBuf},
+};
+
 use color_eyre::eyre::{Result, eyre};
+use serde::Serialize;
 use serde_json::json;
+use time::{OffsetDateTime, macros::format_description};
 use tracing::{debug, info, warn};
 
 use crate::ConfigArgs;
@@ -21,6 +30,39 @@ const SKIPPED_PLAYLISTS: [&str; 10] = [
     "Motivation Electronic Mix",
     "High Energy Mix",
 ];
+
+#[derive(Default, Serialize)]
+struct SyncReport {
+    playlists: Vec<PlaylistSyncReport>,
+}
+
+#[derive(Serialize)]
+struct PlaylistSyncReport {
+    name: String,
+    source_playlist_id: String,
+    destination_playlist_id: String,
+    source_tracks: usize,
+    duplicate_tracks_skipped: usize,
+    already_synced_tracks: usize,
+    newly_synced_tracks: usize,
+    not_synced_tracks_count: usize,
+    success_rate: f64,
+    not_synced_tracks: Vec<NotSyncedTrack>,
+}
+
+#[derive(Serialize)]
+struct NotSyncedTrack {
+    reason: NotSyncedReason,
+    source_track: Song,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "snake_case")]
+enum NotSyncedReason {
+    MissingAlbumMetadata,
+    NoMatchFound,
+    DuplicateDestinationMatch,
+}
 
 pub async fn synchronize(
     src_api: DynMusicApi,
@@ -66,6 +108,7 @@ pub async fn synchronize_playlists(
     let mut all_new_songs = json!({});
     let mut no_albums = json!({});
     let mut stats = json!({});
+    let mut sync_report = SyncReport::default();
 
     info!("retrieving destination playlists...");
     let mut dst_playlists = dst_api.get_playlists_full().await?;
@@ -94,16 +137,23 @@ pub async fn synchronize_playlists(
         let mut missing_songs = json!([]);
         let mut new_songs = json!([]);
         let mut no_albums_songs = json!([]);
-        let mut dst_songs = vec![];
+        let mut matched_songs = vec![];
+        let mut not_synced_tracks = vec![];
+        let mut already_synced_tracks = 0;
+        let mut newly_synced_tracks = 0;
         let mut success = 0;
         let mut attempts = 0;
+        let original_track_count = src_playlist.songs.len();
 
-        if dedup_songs(&mut src_playlist.songs) {
+        let duplicate_tracks_skipped = if dedup_songs(&mut src_playlist.songs) {
             warn!(
                 "duplicates found in source playlist \"{}\", they will be skipped",
                 src_playlist.name
             );
-        }
+            original_track_count - src_playlist.songs.len()
+        } else {
+            0
+        };
 
         info!("synchronizing playlist \"{}\" ...", src_playlist.name);
 
@@ -111,6 +161,7 @@ pub async fn synchronize_playlists(
         for src_song in &src_playlist.songs {
             // already in destination playlist
             if dst_playlist.songs.contains(src_song) {
+                already_synced_tracks += 1;
                 continue;
             }
             // no album metadata == youtube video
@@ -125,6 +176,10 @@ pub async fn synchronize_playlists(
                         .unwrap()
                         .push(json!(src_song));
                 }
+                not_synced_tracks.push(NotSyncedTrack {
+                    reason: NotSyncedReason::MissingAlbumMetadata,
+                    source_track: src_song.clone(),
+                });
                 continue;
             }
 
@@ -136,16 +191,20 @@ pub async fn synchronize_playlists(
                 if config.debug {
                     missing_songs.as_array_mut().unwrap().push(json!(src_song));
                 }
+                not_synced_tracks.push(NotSyncedTrack {
+                    reason: NotSyncedReason::NoMatchFound,
+                    source_track: src_song.clone(),
+                });
                 continue;
             };
-            dst_songs.push(dst_song);
+            matched_songs.push((src_song.clone(), dst_song));
             success += 1;
         }
 
         // 2. Add missing songs to the destination playlist
-        if !dst_songs.is_empty() {
+        if !matched_songs.is_empty() {
             let mut to_sync = Vec::new();
-            for dst_song in &dst_songs {
+            for (src_song, dst_song) in &matched_songs {
                 // HACK: takes into account discrepancy for YtMusic with no ISRC
                 if dst_playlist.songs.contains(dst_song) {
                     debug!(
@@ -154,6 +213,7 @@ pub async fn synchronize_playlists(
                     );
                     attempts -= 1;
                     success -= 1;
+                    already_synced_tracks += 1;
                     continue;
                 }
                 // Edge case: same song on different album/single that all resolve to the same
@@ -165,6 +225,10 @@ pub async fn synchronize_playlists(
                     );
                     attempts -= 1;
                     success -= 1;
+                    not_synced_tracks.push(NotSyncedTrack {
+                        reason: NotSyncedReason::DuplicateDestinationMatch,
+                        source_track: src_song.clone(),
+                    });
                     continue;
                 }
                 if config.debug {
@@ -172,23 +236,26 @@ pub async fn synchronize_playlists(
                 }
                 to_sync.push(dst_song.clone());
             }
-            debug!(
-                "adding {} songs to destination playlist \"{}\"",
-                to_sync.len(),
-                dst_playlist.name
-            );
-            dst_api
-                .add_songs_to_playlist(&mut dst_playlist, &to_sync)
-                .await?;
+            if !to_sync.is_empty() {
+                debug!(
+                    "adding {} songs to destination playlist \"{}\"",
+                    to_sync.len(),
+                    dst_playlist.name
+                );
+                dst_api
+                    .add_songs_to_playlist(&mut dst_playlist, &to_sync)
+                    .await?;
+                newly_synced_tracks = to_sync.len();
 
-            // like all songs that were added
-            if config.like_all {
-                let new_likes = to_sync
-                    .iter()
-                    .filter(|s| !dst_likes.contains(s))
-                    .cloned()
-                    .collect::<Vec<Song>>();
-                dst_api.add_likes(&new_likes).await?;
+                // like all songs that were added
+                if config.like_all {
+                    let new_likes = to_sync
+                        .iter()
+                        .filter(|s| !dst_likes.contains(s))
+                        .cloned()
+                        .collect::<Vec<Song>>();
+                    dst_api.add_likes(&new_likes).await?;
+                }
             }
         }
 
@@ -208,6 +275,22 @@ pub async fn synchronize_playlists(
                 src_playlist.name
             );
         }
+
+        let source_tracks = src_playlist.songs.len();
+        let successful_tracks = source_tracks - not_synced_tracks.len();
+        let success_rate = sync_success_rate(successful_tracks, source_tracks)?;
+        sync_report.playlists.push(PlaylistSyncReport {
+            name: src_playlist.name.clone(),
+            source_playlist_id: src_playlist.id.clone(),
+            destination_playlist_id: dst_playlist.id.clone(),
+            source_tracks,
+            duplicate_tracks_skipped,
+            already_synced_tracks,
+            newly_synced_tracks,
+            not_synced_tracks_count: not_synced_tracks.len(),
+            success_rate,
+            not_synced_tracks,
+        });
 
         if config.debug {
             stats.as_object_mut().unwrap().insert(
@@ -257,9 +340,75 @@ pub async fn synchronize_playlists(
         }
     }
 
+    let sync_report_path = write_sync_report(&sync_report, &config.sync_report)?;
+    info!("sync report written to: {:?}", sync_report_path);
     info!("Synchronization complete!");
 
     Ok(())
+}
+
+fn sync_success_rate(successful_tracks: usize, source_tracks: usize) -> Result<f64> {
+    if source_tracks == 0 {
+        return Ok(1.0);
+    }
+
+    let successful_tracks = u32::try_from(successful_tracks)?;
+    let source_tracks = u32::try_from(source_tracks)?;
+    Ok(f64::from(successful_tracks) / f64::from(source_tracks))
+}
+
+fn write_sync_report(report: &SyncReport, output: &Path) -> Result<PathBuf> {
+    let output = timestamped_report_path(output)?;
+    let report = serde_json::to_string_pretty(report)?;
+
+    for attempt in 0.. {
+        let output = if attempt == 0 {
+            output.clone()
+        } else {
+            path_with_stem_suffix(&output, &format!("_{attempt}"))
+        };
+        if let Some(parent) = output.parent().filter(|p| !p.as_os_str().is_empty()) {
+            std::fs::create_dir_all(parent)?;
+        }
+        match OpenOptions::new().write(true).create_new(true).open(&output) {
+            Ok(mut file) => {
+                file.write_all(report.as_bytes())?;
+                return Ok(output);
+            }
+            Err(err) if err.kind() == ErrorKind::AlreadyExists => {}
+            Err(err) => return Err(err.into()),
+        }
+    }
+
+    unreachable!("unbounded sync report filename retry loop exhausted")
+}
+
+fn timestamped_report_path(output: &Path) -> Result<PathBuf> {
+    let timestamp = OffsetDateTime::now_utc().format(format_description!(
+        "[year][month][day]T[hour][minute][second]Z"
+    ))?;
+    Ok(path_with_timestamp(output, &timestamp))
+}
+
+fn path_with_timestamp(output: &Path, timestamp: &str) -> PathBuf {
+    path_with_stem_suffix(output, &format!("_{timestamp}"))
+}
+
+fn path_with_stem_suffix(output: &Path, suffix: &str) -> PathBuf {
+    let mut file_name = output
+        .file_stem()
+        .map_or_else(|| OsString::from("sync_report"), OsString::from);
+    file_name.push(suffix);
+    file_name.push(".");
+    file_name.push(
+        output
+            .extension()
+            .unwrap_or_else(|| std::ffi::OsStr::new("json")),
+    );
+
+    let mut timestamped = output.parent().map_or_else(PathBuf::new, Path::to_path_buf);
+    timestamped.push(file_name);
+    timestamped
 }
 
 pub async fn synchronize_likes(src_api: &DynMusicApi, dst_api: &DynMusicApi) -> Result<()> {

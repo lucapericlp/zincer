@@ -147,7 +147,7 @@ impl TidalApi {
         };
         let poll_interval = device_res.interval.unwrap_or(2);
         let expires_at = std::time::Instant::now()
-            + std::time::Duration::from_secs(device_res.expires_in as u64);
+            + std::time::Duration::from_secs(u64::from(device_res.expires_in));
 
         loop {
             let res = client
