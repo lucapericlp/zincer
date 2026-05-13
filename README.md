@@ -148,6 +148,30 @@ Notes:
 - By default, SyncDisBoi uses Tidal's "Android Auto" application credentials to request OAuth access.
 - However, you can also create your own Tidal application and then use it in SyncDisBoi by providing its client id and client secret.
 
+### Daily Raspberry Pi sync
+
+To run Spotify to Tidal sync once per day at noon on a Raspberry Pi, first run
+the sync command manually on the Pi so Spotify and Tidal OAuth tokens are cached.
+Then install the systemd user service and timer:
+
+```bash
+SPOTIFY_CLIENT_ID="<CLIENT_ID>" SPOTIFY_CLIENT_SECRET="<CLIENT_SECRET>" \
+    ./scripts/setup-daily-spotify-tidal-sync --enable-linger
+```
+
+The script is idempotent: rerunning it updates the environment file, service,
+and timer in place. It installs:
+- `~/.config/systemd/user/syncdisboi-spotify-to-tidal.service`
+- `~/.config/systemd/user/syncdisboi-spotify-to-tidal.timer`
+- `~/.config/SyncDisBoi/spotify-to-tidal.env`
+
+Useful commands:
+```bash
+systemctl --user list-timers syncdisboi-spotify-to-tidal.timer
+systemctl --user start syncdisboi-spotify-to-tidal.service
+journalctl --user -u syncdisboi-spotify-to-tidal.service
+```
+
 ### Debug mode
 
 Playlist synchronization writes a timestamped JSON report by default, for example
