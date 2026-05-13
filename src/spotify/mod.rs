@@ -202,9 +202,12 @@ impl SpotifyApi {
 
     async fn listen_for_code(auth_url: &str, host_port: &str) -> Result<String> {
         let listener = TcpListener::bind(host_port).await?;
-        webbrowser::open(auth_url)?;
 
-        info!("please authorize the app in your browser");
+        info!("please authorize the app in your browser: {}", auth_url);
+        if let Err(err) = webbrowser::open(auth_url) {
+            warn!("failed to open Spotify authorization URL in a browser: {err}");
+        }
+
         let (socket, _) = listener.accept().await?;
 
         socket.readable().await?;

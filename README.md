@@ -112,6 +112,7 @@ After the first authorization, the OAuth token will be cached in `~/.config/Sync
 
 Notes:
 - After authorizing access for your Spotify account, SyncDisBoi will open the 'http://127.0.0.1:8888/callback' URL in your browser. If you get an 'Unable to connect' response this is normal as the server is quickly opened and shutdown once it receives the auth code.
+- On a headless server, copy the Spotify authorization link printed in the logs into a browser on another machine.
 
 ### Youtube Music API setup
 
