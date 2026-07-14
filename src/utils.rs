@@ -3,7 +3,7 @@ use color_eyre::eyre::eyre;
 use regex::Regex;
 use reqwest::StatusCode;
 use serde::de::DeserializeOwned;
-use tracing::error;
+use tracing::{error, info};
 
 use crate::{ConfigArgs, music_api::Song};
 
@@ -129,6 +129,13 @@ where
     Ok(res.inspect_err(|_| {
         let _ = std::fs::write(format!("debug/{}_last_error.json", platform), full);
     })?)
+}
+
+/// Log an outgoing request's full payload so that a failing request can be
+/// traced back to the data that triggered it (e.g. a playlist rejected by the
+/// API).
+pub fn log_request(platform: &str, method: &str, url: &str, body: &serde_json::Value) {
+    info!("{} request: {} {} body: {}", platform, method, url, body);
 }
 
 pub fn http_error_with_body(status: StatusCode, body: &[u8]) -> color_eyre::Report {

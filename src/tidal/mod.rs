@@ -21,7 +21,7 @@ use crate::music_api::{
 };
 use crate::tidal::model::{TidalPlaylistCreateResponse, TidalSearchResponse};
 use crate::utils::{
-    debug_response_bytes, http_error_with_body, parse_response_json,
+    debug_response_bytes, http_error_with_body, log_request, parse_response_json,
 };
 
 pub struct TidalApi {
@@ -265,8 +265,14 @@ impl TidalApi {
         for attempt in 0..=Self::MAX_RETRIES {
             let mut request = match method {
                 HttpMethod::Get(p) => self.client.get(url).query(p),
-                HttpMethod::Post(b) => self.client.post(url).form(b),
-                HttpMethod::Put(b) => self.client.put(url).form(b),
+                HttpMethod::Post(b) => {
+                    log_request(Self::RES_DEBUG_FILENAME, "POST", url, b);
+                    self.client.post(url).form(b)
+                }
+                HttpMethod::Put(b) => {
+                    log_request(Self::RES_DEBUG_FILENAME, "PUT", url, b);
+                    self.client.put(url).form(b)
+                }
             };
             if let Some((limit, offset)) = lim_off {
                 request = request.query(&[("limit", limit), ("offset", offset)]);
@@ -436,6 +442,12 @@ impl MusicApi for TidalApi {
     }
 
     async fn create_playlist(&self, name: &str, public: bool) -> Result<Playlist> {
+        info!(
+            "creating TIDAL playlist \"{}\" (name length: {} chars, {} bytes)",
+            name,
+            name.chars().count(),
+            name.len()
+        );
         let url = format!(
             "{}/v2/my-collection/playlists/folders/create-playlist",
             Self::API_URL
