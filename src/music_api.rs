@@ -11,6 +11,16 @@ pub const PLAYLIST_DESC: &str = "Playlist created by SyncDisBoi";
 
 pub type DynMusicApi = Box<dyn MusicApi + Sync>;
 
+/// Result of looking a song up on a platform, distinguishing "the platform
+/// returned candidates we could not read" from a genuine miss.
+#[derive(Debug)]
+pub enum SearchOutcome {
+    Found(Song),
+    NotFound,
+    /// The platform returned `candidates` results, but none could be parsed.
+    Unparseable { candidates: usize },
+}
+
 #[async_trait]
 pub trait MusicApi {
     fn request_concurrency(&self) -> usize {
@@ -58,6 +68,15 @@ pub trait MusicApi {
     async fn delete_playlist(&self, playlist: Playlist) -> Result<()>;
 
     async fn search_song(&self, song: &Song) -> Result<Option<Song>>;
+
+    /// Like `search_song`, but reports unparseable results separately.
+    /// Platforms that can tell the difference override this.
+    async fn search_song_outcome(&self, song: &Song) -> Result<SearchOutcome> {
+        Ok(match self.search_song(song).await? {
+            Some(found) => SearchOutcome::Found(found),
+            None => SearchOutcome::NotFound,
+        })
+    }
 
     async fn search_songs(&self, songs: &[Song]) -> Result<Vec<Option<Song>>> {
         let owned_songs = songs
@@ -149,8 +168,18 @@ impl Song {
         if self.source == other.source {
             return self.id == other.id;
         }
-        if self.isrc.is_some() && other.isrc.is_some() {
-            return self.isrc == other.isrc;
+        // A shared ISRC is conclusive. Different ISRCs are not: labels
+        // sometimes register the same recording twice (e.g. once per
+        // platform delivery), so fall through to the metadata checks, and
+        // additionally require a shared artist to keep remixes and edits
+        // with coincidentally equal durations apart.
+        let isrc_mismatch = match (&self.isrc, &other.isrc) {
+            (Some(a), Some(b)) if a == b => return true,
+            (Some(_), Some(_)) => true,
+            _ => false,
+        };
+        if isrc_mismatch && !self.shares_artist_with(other) {
+            return false;
         }
 
         // Check song name resemblance
@@ -195,6 +224,13 @@ impl Song {
         }
 
         true
+    }
+
+    fn shares_artist_with(&self, other: &Self) -> bool {
+        self.artists.iter().any(|a| {
+            let name = a.clean_name();
+            other.artists.iter().any(|b| b.clean_name() == name)
+        })
     }
 
     pub fn build_queries(&self) -> Vec<String> {
@@ -300,4 +336,83 @@ pub struct OAuthRefreshToken {
     pub expires_in: u64,
     pub scope: String,
     pub token_type: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn song(source: MusicApiType, isrc: &str, name: &str, album: &str, artists: &[&str], ms: usize) -> Song {
+        Song {
+            source,
+            id: format!("{name}-{isrc}"),
+            sid: None,
+            isrc: Some(isrc.to_string()),
+            name: name.to_string(),
+            album: Some(Album { id: None, name: album.to_string() }),
+            artists: artists
+                .iter()
+                .map(|a| Artist { id: None, name: (*a).to_string() })
+                .collect(),
+            duration_ms: ms,
+        }
+    }
+
+    fn spotify_nice_to_know_you() -> Song {
+        song(
+            MusicApiType::Spotify,
+            "GBAYE2501225",
+            "Nice to Know You + Loukeman + Leod",
+            "Fancy Some More?",
+            &["PinkPantheress", "Loukeman", "Leod"],
+            202_065,
+        )
+    }
+
+    #[test]
+    fn same_isrc_is_a_match() {
+        let tidal = song(MusicApiType::Tidal, "GBAYE2501225", "Other", "Other", &["X"], 1_000);
+        assert!(spotify_nice_to_know_you().compare(&tidal));
+    }
+
+    #[test]
+    fn different_isrc_falls_back_to_metadata() {
+        // TIDAL registers this recording under another ISRC.
+        let tidal = song(
+            MusicApiType::Tidal,
+            "GBAYE2501423",
+            "Nice to Know You + Loukeman + Leod",
+            "Fancy Some More?",
+            &["PinkPantheress"],
+            202_000,
+        );
+        assert!(spotify_nice_to_know_you().compare(&tidal));
+    }
+
+    #[test]
+    fn different_isrc_without_a_shared_artist_is_not_a_match() {
+        let tidal = song(
+            MusicApiType::Tidal,
+            "GBAYE2501423",
+            "Nice to Know You + Loukeman + Leod",
+            "Fancy Some More?",
+            &["Someone Else"],
+            202_000,
+        );
+        assert!(!spotify_nice_to_know_you().compare(&tidal));
+    }
+
+    #[test]
+    fn different_isrc_and_duration_is_not_a_match() {
+        // e.g. an extended mix sharing the cleaned title and album
+        let tidal = song(
+            MusicApiType::Tidal,
+            "GBAYE2509999",
+            "Nice to Know You + Loukeman + Leod (Extended)",
+            "Fancy Some More?",
+            &["PinkPantheress"],
+            262_000,
+        );
+        assert!(!spotify_nice_to_know_you().compare(&tidal));
+    }
 }

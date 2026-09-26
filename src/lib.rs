@@ -1,3 +1,4 @@
+pub mod events;
 pub mod export;
 pub mod import;
 pub mod music_api;
@@ -41,4 +42,13 @@ pub struct ConfigArgs {
     /// Proxy to use for all requests in the format http://<ip>:<port>
     #[arg(long)]
     pub proxy: Option<String>,
+
+    /// Only synchronize these source playlists (by ID or exact name).
+    /// Repeatable. Without it, every source playlist is synchronized.
+    #[arg(long = "playlist", value_name = "ID_OR_NAME")]
+    pub playlists: Vec<String>,
+
+    /// Print machine-readable `ZINCER_EVENT {json}` progress lines to stdout
+    #[arg(long, default_value = "false")]
+    pub progress_events: bool,
 }

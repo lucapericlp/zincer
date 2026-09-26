@@ -143,6 +143,8 @@ pub enum MusicPlatformDst {
         #[arg(short, long)]
         input: PathBuf,
     },
+    /// Print the source platform's playlists (id and name) as JSON
+    Playlists,
 }
 
 #[derive(ValueEnum, Clone, Debug)]

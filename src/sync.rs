@@ -12,7 +12,8 @@ use time::{OffsetDateTime, macros::format_description};
 use tracing::{debug, info, warn};
 
 use crate::ConfigArgs;
-use crate::music_api::{DynMusicApi, MusicApiType, Playlist, Song};
+use crate::events;
+use crate::music_api::{DynMusicApi, MusicApiType, Playlist, SearchOutcome, Song};
 use crate::utils::dedup_songs;
 
 // TODO: Parse playlist owner to ignore platform-specific playlists?
@@ -62,6 +63,8 @@ enum NotSyncedReason {
     MissingAlbumMetadata,
     NoMatchFound,
     DuplicateDestinationMatch,
+    /// The destination returned candidates, but none could be parsed.
+    UnparseableDestinationResults,
 }
 
 pub async fn synchronize(
@@ -88,7 +91,26 @@ pub async fn synchronize(
     }
 
     info!("retrieving source playlists...");
-    let src_playlists = src_api.get_playlists_full().await?;
+    events::emit("stage", json!({"stage": "load_source"}));
+    let src_playlists = if config.playlists.is_empty() {
+        src_api.get_playlists_full().await?
+    } else {
+        let infos = src_api.get_playlists_info().await?;
+        let mut selected = select_playlists(infos, &config.playlists)?;
+        for playlist in &mut selected {
+            playlist.songs = src_api.get_playlist_songs(&playlist.id).await?;
+        }
+        selected
+    };
+    events::emit(
+        "source_loaded",
+        json!({
+            "playlists": src_playlists
+                .iter()
+                .map(|p| json!({"id": p.id, "name": p.name, "tracks": p.songs.len()}))
+                .collect::<Vec<_>>(),
+        }),
+    );
 
     synchronize_playlists(src_playlists, &dst_api, &config).await?;
 
@@ -111,27 +133,49 @@ pub async fn synchronize_playlists(
     let mut sync_report = SyncReport::default();
 
     info!("retrieving destination playlists...");
-    let mut dst_playlists = dst_api.get_playlists_full().await?;
+    events::emit("stage", json!({"stage": "load_destination"}));
+    let mut dst_playlists = if config.playlists.is_empty() {
+        dst_api.get_playlists_full().await?
+    } else {
+        // Only the destination playlists a selected source maps to (by
+        // name) need their songs fetched.
+        let wanted: Vec<&str> = src_playlists.iter().map(|p| p.name.as_str()).collect();
+        let mut infos = dst_api.get_playlists_info().await?;
+        infos.retain(|p| wanted.contains(&p.name.as_str()));
+        for playlist in &mut infos {
+            playlist.songs = dst_api.get_playlist_songs(&playlist.id).await?;
+        }
+        infos
+    };
     let mut dst_likes = vec![];
     if config.like_all {
         info!("retrieving destination likes...");
         dst_likes = dst_api.get_likes().await?;
     }
 
-    for mut src_playlist in src_playlists
-        .into_iter()
-        .filter(|p| !SKIPPED_PLAYLISTS.contains(&p.name.as_str()) && !p.songs.is_empty())
-    {
+    for mut src_playlist in src_playlists.into_iter().filter(|p| {
+        let skip_reason = if SKIPPED_PLAYLISTS.contains(&p.name.as_str()) {
+            Some("platform-generated playlist")
+        } else if p.songs.is_empty() {
+            Some("source playlist is empty")
+        } else {
+            None
+        };
+        if let Some(reason) = skip_reason {
+            events::emit("playlist_skipped", json!({"name": p.name, "reason": reason}));
+        }
+        skip_reason.is_none()
+    }) {
         if src_playlist.songs.is_empty() {
             continue;
         }
 
-        let mut dst_playlist = match dst_playlists
+        let (mut dst_playlist, created) = match dst_playlists
             .iter()
             .position(|p| p.name == src_playlist.name)
         {
-            Some(i) => dst_playlists.remove(i),
-            None => dst_api.create_playlist(&src_playlist.name, false).await?,
+            Some(i) => (dst_playlists.remove(i), false),
+            None => (dst_api.create_playlist(&src_playlist.name, false).await?, true),
         };
 
         let mut missing_songs = json!([]);
@@ -156,12 +200,37 @@ pub async fn synchronize_playlists(
         };
 
         info!("synchronizing playlist \"{}\" ...", src_playlist.name);
+        let total_tracks = src_playlist.songs.len();
+        events::emit(
+            "playlist_start",
+            json!({
+                "name": src_playlist.name,
+                "source_playlist_id": src_playlist.id,
+                "destination_playlist_id": dst_playlist.id,
+                "destination_created": created,
+                "source_tracks": total_tracks,
+                "duplicate_tracks_skipped": duplicate_tracks_skipped,
+            }),
+        );
+        let emit_track = |index: usize, song: &Song, status: &str| {
+            events::emit(
+                "track",
+                json!({
+                    "playlist": src_playlist.name,
+                    "index": index + 1,
+                    "total": total_tracks,
+                    "status": status,
+                    "track": song.to_string(),
+                }),
+            );
+        };
 
         // 1. Search for each song in the destination playlist
-        for src_song in &src_playlist.songs {
+        for (index, src_song) in src_playlist.songs.iter().enumerate() {
             // already in destination playlist
             if dst_playlist.songs.contains(src_song) {
                 already_synced_tracks += 1;
+                emit_track(index, src_song, "already_synced");
                 continue;
             }
             // no album metadata == youtube video
@@ -180,12 +249,28 @@ pub async fn synchronize_playlists(
                     reason: NotSyncedReason::MissingAlbumMetadata,
                     source_track: src_song.clone(),
                 });
+                emit_track(index, src_song, "missing_album_metadata");
                 continue;
             }
 
             attempts += 1;
 
-            let dst_song = dst_api.search_song(src_song).await?;
+            let dst_song = match dst_api.search_song_outcome(src_song).await? {
+                SearchOutcome::Found(found) => Some(found),
+                SearchOutcome::NotFound => None,
+                SearchOutcome::Unparseable { candidates } => {
+                    warn!(
+                        "{} destination results for \"{}\" could not be parsed",
+                        candidates, src_song
+                    );
+                    not_synced_tracks.push(NotSyncedTrack {
+                        reason: NotSyncedReason::UnparseableDestinationResults,
+                        source_track: src_song.clone(),
+                    });
+                    emit_track(index, src_song, "unparseable_destination_results");
+                    continue;
+                }
+            };
             let Some(dst_song) = dst_song else {
                 debug!("no match found for song: {}", src_song);
                 if config.debug {
@@ -195,10 +280,12 @@ pub async fn synchronize_playlists(
                     reason: NotSyncedReason::NoMatchFound,
                     source_track: src_song.clone(),
                 });
+                emit_track(index, src_song, "no_match_found");
                 continue;
             };
             matched_songs.push((src_song.clone(), dst_song));
             success += 1;
+            emit_track(index, src_song, "matched");
         }
 
         // 2. Add missing songs to the destination playlist
@@ -242,6 +329,10 @@ pub async fn synchronize_playlists(
                     to_sync.len(),
                     dst_playlist.name
                 );
+                events::emit(
+                    "adding",
+                    json!({"playlist": dst_playlist.name, "tracks": to_sync.len()}),
+                );
                 dst_api
                     .add_songs_to_playlist(&mut dst_playlist, &to_sync)
                     .await?;
@@ -279,7 +370,7 @@ pub async fn synchronize_playlists(
         let source_tracks = src_playlist.songs.len();
         let successful_tracks = source_tracks - not_synced_tracks.len();
         let success_rate = sync_success_rate(successful_tracks, source_tracks)?;
-        sync_report.playlists.push(PlaylistSyncReport {
+        let playlist_report = PlaylistSyncReport {
             name: src_playlist.name.clone(),
             source_playlist_id: src_playlist.id.clone(),
             destination_playlist_id: dst_playlist.id.clone(),
@@ -290,7 +381,9 @@ pub async fn synchronize_playlists(
             not_synced_tracks_count: not_synced_tracks.len(),
             success_rate,
             not_synced_tracks,
-        });
+        };
+        events::emit("playlist_done", json!(&playlist_report));
+        sync_report.playlists.push(playlist_report);
 
         if config.debug {
             stats.as_object_mut().unwrap().insert(
@@ -342,9 +435,33 @@ pub async fn synchronize_playlists(
 
     let sync_report_path = write_sync_report(&sync_report, &config.sync_report)?;
     info!("sync report written to: {:?}", sync_report_path);
+    events::emit("report", json!({"path": sync_report_path}));
     info!("Synchronization complete!");
 
     Ok(())
+}
+
+/// Keep the playlists matching any selector (by ID or exact name), in the
+/// source platform's order. Every selector must match at least one playlist.
+fn select_playlists(playlists: Vec<Playlist>, selectors: &[String]) -> Result<Vec<Playlist>> {
+    let unmatched: Vec<&String> = selectors
+        .iter()
+        .filter(|sel| !playlists.iter().any(|p| &p.id == *sel || &p.name == *sel))
+        .collect();
+    if !unmatched.is_empty() {
+        return Err(eyre!(
+            "no source playlist matches: {}",
+            unmatched
+                .iter()
+                .map(|s| format!("{s:?}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    Ok(playlists
+        .into_iter()
+        .filter(|p| selectors.iter().any(|sel| &p.id == sel || &p.name == sel))
+        .collect())
 }
 
 fn sync_success_rate(successful_tracks: usize, source_tracks: usize) -> Result<f64> {
@@ -456,4 +573,34 @@ pub async fn synchronize_likes(src_api: &DynMusicApi, dst_api: &DynMusicApi) -> 
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn playlist(id: &str, name: &str) -> Playlist {
+        Playlist {
+            id: id.to_string(),
+            name: name.to_string(),
+            songs: vec![],
+        }
+    }
+
+    #[test]
+    fn select_playlists_matches_by_id_or_name_in_source_order() {
+        let playlists = vec![playlist("a", "One"), playlist("b", "Two"), playlist("c", "Three")];
+        let selected =
+            select_playlists(playlists, &["Three".to_string(), "a".to_string()]).unwrap();
+        let ids: Vec<&str> = selected.iter().map(|p| p.id.as_str()).collect();
+        assert_eq!(ids, vec!["a", "c"]);
+    }
+
+    #[test]
+    fn select_playlists_rejects_unknown_selectors() {
+        let err = select_playlists(vec![playlist("a", "One")], &["Nope".to_string()])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("\"Nope\""), "{err}");
+    }
 }

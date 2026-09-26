@@ -11,13 +11,13 @@ use reqwest::header::HeaderMap;
 use serde::Deserialize;
 use serde::de::{DeserializeOwned, IgnoredAny};
 use serde_json::json;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use self::model::{TidalPageResponse, TidalPlaylistResponse, TidalSongItemResponse};
 use crate::ConfigArgs;
 use crate::music_api::{
     MusicApi, MusicApiType, OAuthRefreshToken, OAuthReqToken, OAuthToken, PLAYLIST_DESC, Playlist,
-    Playlists, Song, Songs,
+    Playlists, SearchOutcome, Song, Songs,
 };
 use crate::tidal::model::{TidalPlaylistCreateResponse, TidalSearchResponse};
 use crate::utils::{
@@ -136,6 +136,10 @@ impl TidalApi {
             format!("https://{}", device_res.verification_uri_complete)
         };
 
+        crate::events::emit(
+            "auth_required",
+            serde_json::json!({"platform": "tidal", "url": url}),
+        );
         webbrowser::open(&url)?;
         info!("please authorize the app in your browser: {}", url);
 
@@ -531,6 +535,15 @@ impl MusicApi for TidalApi {
     }
 
     async fn search_song(&self, song: &Song) -> Result<Option<Song>> {
+        Ok(match self.search_song_outcome(song).await? {
+            SearchOutcome::Found(found) => Some(found),
+            SearchOutcome::NotFound | SearchOutcome::Unparseable { .. } => None,
+        })
+    }
+
+    async fn search_song_outcome(&self, song: &Song) -> Result<SearchOutcome> {
+        // Candidates TIDAL returned for the ISRC that could not be parsed.
+        let mut unparseable = 0;
         if let Some(isrc) = &song.isrc {
             let url = format!("{}/tracks", Self::API_V2_URL);
             let params = json!({
@@ -541,14 +554,16 @@ impl MusicApi for TidalApi {
             let res: TidalMediaResponse = self
                 .make_request_json(&url, &HttpMethod::Get(&params), Some((1, 0)))
                 .await?;
-            if res.data.is_empty() {
-                return Ok(None);
+            if !res.data.is_empty() {
+                let (mut res_songs, skipped) = res.into_songs()?;
+                if !res_songs.0.is_empty() {
+                    return Ok(SearchOutcome::Found(res_songs.0.remove(0)));
+                }
+                unparseable = skipped;
             }
-            let mut res_songs: Songs = res.try_into()?;
-            if res_songs.0.is_empty() {
-                return Ok(None);
-            }
-            return Ok(Some(res_songs.0.remove(0)));
+            // The same recording can carry a different ISRC on TIDAL, so a
+            // miss here is not conclusive: fall back to a metadata search.
+            debug!("no usable TIDAL track for ISRC {isrc}, searching by metadata: {song}");
         }
 
         let url = format!("{}/v1/search", Self::API_URL);
@@ -567,11 +582,16 @@ impl MusicApi for TidalApi {
             // iterate over top 3 results
             for res_song in res_songs.0.into_iter().take(3) {
                 if song.compare(&res_song) {
-                    return Ok(Some(res_song));
+                    return Ok(SearchOutcome::Found(res_song));
                 }
             }
         }
-        Ok(None)
+        if unparseable > 0 {
+            return Ok(SearchOutcome::Unparseable {
+                candidates: unparseable,
+            });
+        }
+        Ok(SearchOutcome::NotFound)
     }
 
     async fn add_likes(&self, songs: &[Song]) -> Result<()> {
@@ -614,5 +634,71 @@ impl MusicApi for TidalApi {
             .await?;
         let songs: Songs = res.try_into()?;
         Ok(songs.0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+
+    use super::*;
+    use crate::music_api::{Album, Artist};
+
+    fn spotify_song(isrc: &str, name: &str, album: &str, artists: &[&str], ms: usize) -> Song {
+        Song {
+            source: MusicApiType::Spotify,
+            id: "spotify".into(),
+            sid: None,
+            isrc: Some(isrc.into()),
+            name: name.into(),
+            album: Some(Album { id: None, name: album.into() }),
+            artists: artists.iter().map(|a| Artist { id: None, name: (*a).into() }).collect(),
+            duration_ms: ms,
+        }
+    }
+
+    // Live, read-only: searches TIDAL for two tracks that used to be reported
+    // as unmatched. Needs a cached TIDAL token (SyncDisBoi/tidal_oauth.json).
+    // Run with `cargo test -- --ignored live_search`.
+    #[tokio::test]
+    #[ignore = "requires a live TIDAL session"]
+    async fn live_search_finds_previously_missed_tracks() {
+        let config = ConfigArgs::parse_from(["zincer"]);
+        let token = dirs::config_dir().unwrap().join("SyncDisBoi").join("tidal_oauth.json");
+        let api = TidalApi::new(
+            "\x66\x58\x32\x4a\x78\x64\x6d\x6e\x74\x5a\x57\x4b\x30\x69\x78\x54",
+            "\x4d\x55\x35\x75\x4f\x55\x46\x6d\x52\x45\x46\x71\x65\x48\x4a\x6e\x53\x6b\x5a\x4b\x59\x6b\x74\x4f\x56\x30\x78\x6c\x51\x58\x6c\x4c\x52\x31\x5a\x48\x62\x55\x6c\x4f\x64\x56\x68\x51\x55\x45\x78\x49\x56\x6c\x68\x42\x64\x6e\x68\x42\x5a\x7a\x30\x3d",
+            token,
+            false,
+            config,
+        )
+        .await
+        .unwrap();
+
+        // Different ISRC on TIDAL (GBAYE2501423): found via metadata fallback.
+        let nice = spotify_song(
+            "GBAYE2501225",
+            "Nice to Know You + Loukeman + Leod",
+            "Fancy Some More?",
+            &["PinkPantheress", "Loukeman", "Leod"],
+            202_065,
+        );
+        match api.search_song_outcome(&nice).await.unwrap() {
+            SearchOutcome::Found(song) => assert_eq!(song.id, "465153336"),
+            other => panic!("expected a match, got {other:?}"),
+        }
+
+        // Same ISRC, but TIDAL omits an artist from `included`.
+        let horns = spotify_song(
+            "GBAHS2501558",
+            "Beto’s Horns - fred remix",
+            "Beto’s Horns (fred remix)",
+            &["Fred again..", "CA7RIEL & Paco Amoroso"],
+            226_000,
+        );
+        match api.search_song_outcome(&horns).await.unwrap() {
+            SearchOutcome::Found(song) => assert_eq!(song.id, "470727704"),
+            other => panic!("expected a match, got {other:?}"),
+        }
     }
 }

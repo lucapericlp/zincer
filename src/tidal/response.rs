@@ -1,5 +1,5 @@
 use color_eyre::eyre::{Error, OptionExt, Result, eyre};
-use tracing::error;
+use tracing::{error, warn};
 
 use super::model::{
     TidalMediaData, TidalMediaResponse, TidalPageResponse, TidalPlaylistResponse,
@@ -118,7 +118,16 @@ impl TryInto<Song> for TidalSongResponse {
 impl TryInto<Songs> for TidalMediaResponse {
     type Error = Error;
 
-    fn try_into(mut self) -> Result<Songs, Self::Error> {
+    fn try_into(self) -> Result<Songs, Self::Error> {
+        let (songs, _skipped) = self.into_songs()?;
+        Ok(songs)
+    }
+}
+
+impl TidalMediaResponse {
+    /// Parse every track, most popular first; returns the songs and how many
+    /// tracks could not be parsed.
+    pub fn into_songs(mut self) -> Result<(Songs, usize)> {
         if self.data.is_empty() {
             return Err(eyre!("missing song data"));
         }
@@ -133,16 +142,29 @@ impl TryInto<Songs> for TidalMediaResponse {
         let included = self.included.ok_or_eyre("missing included data")?;
 
         let mut songs = Vec::new();
+        let mut skipped = 0;
         for data in self.data {
             match media_data_to_song(data, &included) {
                 Ok(s) => songs.push(s),
                 Err(e) => {
+                    skipped += 1;
                     error!("failed to parse song in response, skipping it: {}", e);
                 }
             }
         }
-        Ok(Songs(songs))
+        Ok((Songs(songs), skipped))
     }
+}
+
+/// The included resource a relationship points at. TIDAL's JSON:API
+/// responses can omit some of them (e.g. a track's second artist), and IDs
+/// are only unique per type.
+fn find_included<'a>(
+    included: &'a [TidalMediaData],
+    typ: &str,
+    id: &str,
+) -> Option<&'a TidalMediaData> {
+    included.iter().find(|i| i.typ == typ && i.id == id)
 }
 
 fn media_data_to_song(data: TidalMediaData, included: &[TidalMediaData]) -> Result<Song> {
@@ -185,19 +207,22 @@ fn media_data_to_song(data: TidalMediaData, included: &[TidalMediaData]) -> Resu
         let Some(album_rel) = album_rel.first() else {
             return Err(eyre!("missing song album data"));
         };
-        let album_data = included
-            .iter()
-            .find(|i| i.id == album_rel.id)
-            .ok_or_eyre("missing song album data")?;
-        let title = album_data
-            .attributes
-            .title
-            .clone()
-            .ok_or_eyre("missing song album title")?;
-        album = Some(Album {
-            id: Some(album_data.id.clone()),
-            name: title,
-        });
+        if let Some(album_data) = find_included(included, "albums", &album_rel.id) {
+            let title = album_data
+                .attributes
+                .title
+                .clone()
+                .ok_or_eyre("missing song album title")?;
+            album = Some(Album {
+                id: Some(album_data.id.clone()),
+                name: title,
+            });
+        } else {
+            warn!(
+                "album {} of track {} missing from TIDAL response, continuing without it",
+                album_rel.id, data.id
+            );
+        }
     }
     if let Some(artists_rel) = data
         .relationships
@@ -206,10 +231,13 @@ fn media_data_to_song(data: TidalMediaData, included: &[TidalMediaData]) -> Resu
         .and_then(|a| a.data.as_ref())
     {
         for artist_rel in artists_rel {
-            let artist_data = included
-                .iter()
-                .find(|i| i.id == artist_rel.id)
-                .ok_or_eyre("missing song artist data")?;
+            let Some(artist_data) = find_included(included, "artists", &artist_rel.id) else {
+                warn!(
+                    "artist {} of track {} missing from TIDAL response, skipping the artist",
+                    artist_rel.id, data.id
+                );
+                continue;
+            };
             let name = artist_data
                 .attributes
                 .name
@@ -232,4 +260,64 @@ fn media_data_to_song(data: TidalMediaData, included: &[TidalMediaData]) -> Resu
         artists,
         duration_ms: duration,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Shape of TIDAL's `GET /v2/tracks?filter[isrc]=GBAHS2501558&include=albums,artists`
+    // response: the track names two artists, but `included` only carries one.
+    const TRUNCATED_INCLUDES: &str = r#"{
+        "data": [{
+            "id": "470727704", "type": "tracks",
+            "attributes": {"title": "Beto’s Horns (fred remix)", "isrc": "GBAHS2501558",
+                           "duration": "PT3M46S", "popularity": 0.57},
+            "relationships": {
+                "albums": {"data": [{"id": "470727703", "type": "albums"}]},
+                "artists": {"data": [{"id": "17062018", "type": "artists"},
+                                     {"id": "10313951", "type": "artists"}]}
+            }
+        }],
+        "included": [
+            {"id": "470727703", "type": "albums", "attributes": {"title": "Beto’s Horns (fred remix)"}},
+            {"id": "17062018", "type": "artists", "attributes": {"name": "Fred again.."}}
+        ]
+    }"#;
+
+    #[test]
+    fn missing_included_artist_keeps_the_track() {
+        let res: TidalMediaResponse = serde_json::from_str(TRUNCATED_INCLUDES).unwrap();
+        let (songs, skipped) = res.into_songs().unwrap();
+        assert_eq!(skipped, 0);
+        assert_eq!(songs.0.len(), 1);
+        let song = &songs.0[0];
+        assert_eq!(song.id, "470727704");
+        assert_eq!(song.isrc.as_deref(), Some("GBAHS2501558"));
+        assert_eq!(song.duration_ms, 226_000);
+        assert_eq!(song.album.as_ref().unwrap().name, "Beto’s Horns (fred remix)");
+        let artists: Vec<&str> = song.artists.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(artists, vec!["Fred again.."]);
+    }
+
+    #[test]
+    fn included_lookup_matches_type_as_well_as_id() {
+        // An album and an artist sharing an ID must not be confused.
+        let json = TRUNCATED_INCLUDES.replace(
+            r#"{"id": "17062018", "type": "artists", "attributes": {"name": "Fred again.."}}"#,
+            r#"{"id": "17062018", "type": "albums", "attributes": {"title": "Not an artist"}}"#,
+        );
+        let res: TidalMediaResponse = serde_json::from_str(&json).unwrap();
+        let (songs, _) = res.into_songs().unwrap();
+        assert!(songs.0[0].artists.is_empty());
+    }
+
+    #[test]
+    fn unparseable_tracks_are_counted() {
+        let json = TRUNCATED_INCLUDES.replace(r#""duration": "PT3M46S", "#, "");
+        let res: TidalMediaResponse = serde_json::from_str(&json).unwrap();
+        let (songs, skipped) = res.into_songs().unwrap();
+        assert!(songs.0.is_empty());
+        assert_eq!(skipped, 1);
+    }
 }
