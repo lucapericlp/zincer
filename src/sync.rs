@@ -13,7 +13,7 @@ use tracing::{debug, info, warn};
 
 use crate::ConfigArgs;
 use crate::events;
-use crate::music_api::{DynMusicApi, MusicApiType, Playlist, Song};
+use crate::music_api::{DynMusicApi, MusicApiType, Playlist, SearchOutcome, Song};
 use crate::utils::dedup_songs;
 
 // TODO: Parse playlist owner to ignore platform-specific playlists?
@@ -63,6 +63,8 @@ enum NotSyncedReason {
     MissingAlbumMetadata,
     NoMatchFound,
     DuplicateDestinationMatch,
+    /// The destination returned candidates, but none could be parsed.
+    UnparseableDestinationResults,
 }
 
 pub async fn synchronize(
@@ -253,7 +255,22 @@ pub async fn synchronize_playlists(
 
             attempts += 1;
 
-            let dst_song = dst_api.search_song(src_song).await?;
+            let dst_song = match dst_api.search_song_outcome(src_song).await? {
+                SearchOutcome::Found(found) => Some(found),
+                SearchOutcome::NotFound => None,
+                SearchOutcome::Unparseable { candidates } => {
+                    warn!(
+                        "{} destination results for \"{}\" could not be parsed",
+                        candidates, src_song
+                    );
+                    not_synced_tracks.push(NotSyncedTrack {
+                        reason: NotSyncedReason::UnparseableDestinationResults,
+                        source_track: src_song.clone(),
+                    });
+                    emit_track(index, src_song, "unparseable_destination_results");
+                    continue;
+                }
+            };
             let Some(dst_song) = dst_song else {
                 debug!("no match found for song: {}", src_song);
                 if config.debug {
