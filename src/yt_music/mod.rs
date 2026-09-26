@@ -218,7 +218,7 @@ impl YtMusicApi {
     }
 
     fn build_endpoint(path: &str, ctoken: Option<&str>) -> String {
-        let mut endpoint = format!("{}{}{}", Self::BASE_API, path, Self::BASE_PARAMS,);
+        let mut endpoint = format!("{}{}{}", Self::BASE_API, path, Self::BASE_PARAMS);
         if let Some(c) = ctoken {
             std::write!(&mut endpoint, "&ctoken={c}&continuation={c}", c = c).unwrap();
         }

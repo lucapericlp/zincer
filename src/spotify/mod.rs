@@ -204,6 +204,10 @@ impl SpotifyApi {
         let listener = TcpListener::bind(host_port).await?;
 
         info!("please authorize the app in your browser: {}", auth_url);
+        crate::events::emit(
+            "auth_required",
+            serde_json::json!({"platform": "spotify", "url": auth_url}),
+        );
         if let Err(err) = webbrowser::open(auth_url) {
             warn!("failed to open Spotify authorization URL in a browser: {err}");
         }
@@ -509,11 +513,17 @@ impl MusicApi for SpotifyApi {
 mod tests {
     use std::env;
 
+    use clap::Parser;
+
     use super::*;
     use crate::yt_music::YtMusicApi;
 
+    // Live test: needs YouTube Music + Spotify credentials and cached OAuth
+    // tokens. Run explicitly with `cargo test -- --ignored`.
     #[tokio::test]
+    #[ignore = "requires live YouTube Music and Spotify credentials"]
     async fn test_spotify_search_from_ytmusic() {
+        let config = ConfigArgs::parse_from(["zincer"]);
         let yt_client_id = env::var("YTMUSIC_CLIENT_ID").unwrap();
         let yt_client_secret = env::var("YTMUSIC_CLIENT_SECRET").unwrap();
         let config_dir = dirs::config_dir().unwrap();
@@ -523,7 +533,7 @@ mod tests {
             &yt_client_secret,
             oauth_token_path,
             false,
-            None,
+            config.clone(),
         )
         .await
         .unwrap();
@@ -534,9 +544,16 @@ mod tests {
 
         let spotify_client_id = env::var("SPOTIFY_CLIENT_ID").unwrap();
         let spotify_secret = env::var("SPOTIFY_CLIENT_SECRET").unwrap();
-        let spotify = SpotifyApi::new(&spotify_client_id, &spotify_secret, None)
-            .await
-            .unwrap();
+        let spotify = SpotifyApi::new(
+            &spotify_client_id,
+            &spotify_secret,
+            config_dir.join("SyncDisBoi").join("spotify_oauth.json"),
+            SpotifyApi::REDIRECT_URI_URL,
+            false,
+            config,
+        )
+        .await
+        .unwrap();
 
         let songs = spotify.search_songs(&songs).await.unwrap();
         let correct_ids = [

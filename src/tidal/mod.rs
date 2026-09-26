@@ -136,6 +136,10 @@ impl TidalApi {
             format!("https://{}", device_res.verification_uri_complete)
         };
 
+        crate::events::emit(
+            "auth_required",
+            serde_json::json!({"platform": "tidal", "url": url}),
+        );
         webbrowser::open(&url)?;
         info!("please authorize the app in your browser: {}", url);
 
